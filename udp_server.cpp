@@ -42,6 +42,12 @@ struct PacketHeader {
 std::atomic<bool> keep_running(true);
 std::atomic<int>  requested_mode(MODE_CLOSE);
 std::atomic<int>  active_mode(MODE_CLOSE);
+std::atomic<bool> is_switching(false);
+std::mutex cache_mutex;
+std::vector<uint8_t> cached_color;
+std::vector<uint8_t> cached_depth;
+uint32_t cached_frame_id = 0;
+int cached_mode = MODE_CLOSE;
 
 struct ModeConfig {
     int color_w, color_h, color_fps;
@@ -61,10 +67,10 @@ void send_frame_chunks(int sockfd, const sockaddr_in& dest,
     uint16_t total_chunks = (dataSize + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
     size_t offset = 0;
     uint16_t chunk_idx = 0;
-
+    
     while (offset < dataSize) {
         size_t chunk_len = std::min((size_t)MAX_CHUNK_SIZE, (size_t)(dataSize - offset));
-
+        
         PacketHeader hdr;
         // convert data to network packet endianness
         hdr.frame_id = htonl(frame_id);
@@ -74,16 +80,48 @@ void send_frame_chunks(int sockfd, const sockaddr_in& dest,
         hdr.stream_type = stream_type;
         hdr.mode = mode;
         memset(hdr.reserved, 0, sizeof(hdr.reserved));
-
+        
         std::vector<uint8_t> packet(sizeof(PacketHeader) + chunk_len);
         memcpy(packet.data(), &hdr, sizeof(hdr));
         memcpy(packet.data() + sizeof(hdr), data + offset, chunk_len);
-
+        
         sendto(sockfd, packet.data(), packet.size(), 0,
-               reinterpret_cast<const struct sockaddr*>(&dest), sizeof(dest));
+        reinterpret_cast<const struct sockaddr*>(&dest), sizeof(dest));
 
         offset += chunk_len;
         chunk_idx++;
+    }
+}
+
+// === Freeze frame sender thread ===
+void freeze_thread(int sockfd, const sockaddr_in& dest) {
+    while (keep_running) {
+        if (is_switching.load()) {
+            std::vector<uint8_t> color_copy, depth_copy;
+            uint32_t fid;
+            int mode;
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                color_copy = cached_color;
+                depth_copy = cached_depth;
+                fid = ++cached_frame_id;
+                mode = cached_mode;
+            }
+
+            if (!color_copy.empty()) {
+                send_frame_chunks(sockfd, dest, color_copy.data(),
+                                  color_copy.size(), fid, STREAM_COLOR, mode);
+            }
+            if (!depth_copy.empty()) {
+                send_frame_chunks(sockfd, dest, depth_copy.data(),
+                                  depth_copy.size(), fid, STREAM_DEPTH, mode);
+            }
+            // std::cout << "[FRZ] Sent 1 frame pair" << std::endl;
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(66)); // ~15fps
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
     }
 }
 
@@ -94,7 +132,7 @@ void command_thread() {
         std::cerr << "[CMD] Socket creation failed!" << std::endl;
         return;
     }
-
+    
     // set options: REUSEADDR (fast rebinding) and SO_RCVTIMEO (200ms timeout)
     int opt = 1;
     setsockopt(cmd_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -156,11 +194,15 @@ void camera_thread() {
     inet_pton(AF_INET, HOST_IP, &dest.sin_addr);
 
     uint32_t frame_id = 0;
+    std::thread frz_thread(freeze_thread, sockfd, dest);
 
     // FPS benchmark
     uint32_t frames_sent = 0;
     uint64_t total_bytes_sent = 0;
     auto fps_start = std::chrono::steady_clock::now();
+    std::vector<uint8_t> cached_color;
+    std::vector<uint8_t> cached_depth;
+    uint32_t cached_frame_id = 0;
 
     while (keep_running) {
         // Apply mode switch if requested
@@ -216,6 +258,7 @@ void camera_thread() {
             config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
 
             pipe.start(config);
+            is_switching.store(false);
             std::cout << "[CAM] Streaming: " << cfg.color_w << "x" << cfg.color_h
                       << "@" << cfg.color_fps << " + "
                       << cfg.depth_w << "x" << cfg.depth_h
@@ -230,12 +273,14 @@ void camera_thread() {
                 auto colorFrame = frameSet->colorFrame();
                 auto depthFrame = frameSet->depthFrame();
                 frame_id++;
+                auto startSend = std::chrono::steady_clock::now();
 
                 if (colorFrame && colorFrame->format() == OB_FORMAT_MJPEG) {
                     const uint8_t* data = static_cast<const uint8_t*>(colorFrame->data());
                     uint32_t size = colorFrame->dataSize();
                     send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_COLOR, current_mode);
                     total_bytes_sent += size;
+                    cached_color.assign(data, data+size);
                 }
 
                 if (depthFrame && depthFrame->format() == OB_FORMAT_Y16) {
@@ -243,9 +288,11 @@ void camera_thread() {
                     uint32_t size = depthFrame->dataSize();
                     send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_DEPTH, current_mode);
                     total_bytes_sent += size;
+                    cached_depth.assign(data, data+size);
                 }
 
                 frames_sent++;
+                auto endSend = std::chrono::steady_clock::now();
 
                 // FPS benchmark (every 1 second)
                 auto now = std::chrono::steady_clock::now();
@@ -258,13 +305,21 @@ void camera_thread() {
                               << " | FPS: " << fps
                               << " | Bandwidth: " << mbps << " Mbps"
                               << " | Frames: " << frame_id
+                              << " | Time used: " << std::chrono::duration<double>(endSend - startSend).count()
                               << std::endl;
                     frames_sent = 0;
                     total_bytes_sent = 0;
                     fps_start = now;
                 }
             }
-
+            
+            // switch the mode
+            is_switching.store(true);   // start sending cached frames
+            // update cache with last frame
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                cached_mode = current_mode;
+            }
             pipe.stop();
             std::cout << "[CAM] Pipeline stopped (mode switch)" << std::endl;
 
@@ -274,6 +329,7 @@ void camera_thread() {
         }
     }
 
+    frz_thread.join();
     close(sockfd);
 }
 

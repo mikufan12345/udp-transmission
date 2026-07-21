@@ -108,7 +108,8 @@ def main():
         except queue.Empty:
             print("[HOST] ⚠️ No frames received in 2s. Check Jetson Nano.")
             continue
-
+        
+        t0 = time.perf_counter_ns()
         # === Decode Color (MJPEG → BGR) ===
         nparr_color = np.frombuffer(color_jpeg, np.uint8)
         color_frame = cv2.imdecode(nparr_color, cv2.IMREAD_COLOR)
@@ -121,7 +122,7 @@ def main():
         depth_vis = cv2.normalize(depth_array, None, 0, 255, cv2.NORM_MINMAX)
         depth_vis = depth_vis.astype(np.uint8)
         depth_colormap = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
-
+        
         if color_frame is not None:
             frame_count += 1
 
@@ -154,7 +155,8 @@ def main():
                 print(f"[HOST] Paired FPS: {fps:.2f} | "
                       f"Color: {color_frame.shape} | "
                       f"Depth: {depth_array.shape} | "
-                      f"Depth range: {depth_array.min()}-{depth_array.max()}mm")
+                      f"Depth range: {depth_array.min()}-{depth_array.max()}mm | "
+                      f"Decode time: {(time.perf_counter_ns()-t0)/1e6}ms")
 
     global keep_running
     keep_running = False
