@@ -14,39 +14,50 @@
 // ============================================================
 // CONFIGURATION
 // ============================================================
-#define HOST_IP             "192.168.0.249" // ip of target computer
-#define UDP_PORT            9999
-#define COLOR_WIDTH         1920
-#define COLOR_HEIGHT        1080
-#define COLOR_FPS           30
-#define DEPTH_WIDTH         640
-#define DEPTH_HEIGHT        576
-#define DEPTH_FPS           30
+#define HOST_IP             "192.168.0.249"
+#define STREAM_PORT         9999    // Video stream (out)
+#define COMMAND_PORT        9998    // Mode switch commands (in)
 #define MAX_CHUNK_SIZE      60000
 // ============================================================
 
-// Stream type identifiers
 #define STREAM_COLOR  0
 #define STREAM_DEPTH  1
 
+#define MODE_CLOSE    0   // 1080p@30 + depth@30
+#define MODE_FAR      1   // 4K@25 + depth@25
+
 #pragma pack(push, 1)
 struct PacketHeader {
-    uint32_t frame_id;       // Shared ID for color+depth sync
+    uint32_t frame_id;
     uint16_t chunk_index;
     uint16_t total_chunks;
-    uint32_t data_size;      // Payload bytes in this chunk
-    uint8_t  stream_type;    // 0=COLOR_MJPEG, 1=DEPTH_Y16
-    uint8_t  reserved[3];    // Alignment padding
+    uint32_t data_size;
+    uint8_t  stream_type;
+    uint8_t  mode;          // Current active mode
+    uint8_t  reserved[2];
 };
 #pragma pack(pop)
-// Header size: 16 bytes
 
+// === Shared State ===
 std::atomic<bool> keep_running(true);
+std::atomic<int>  requested_mode(MODE_CLOSE);
+std::atomic<int>  active_mode(MODE_CLOSE);
 
+struct ModeConfig {
+    int color_w, color_h, color_fps;
+    int depth_w, depth_h, depth_fps;
+};
+
+ModeConfig get_mode_config(int mode) {
+    if (mode == MODE_FAR)
+        return {3840, 2160, 25, 640, 576, 25};
+    return {1920, 1080, 30, 640, 576, 30};
+}
+
+// === UDP Chunk Sender ===
 void send_frame_chunks(int sockfd, const sockaddr_in& dest,
                        const uint8_t* data, uint32_t dataSize,
-                       uint32_t frame_id, uint8_t stream_type) {
-
+                       uint32_t frame_id, uint8_t stream_type, uint8_t mode) {
     uint16_t total_chunks = (dataSize + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
     size_t offset = 0;
     uint16_t chunk_idx = 0;
@@ -55,11 +66,13 @@ void send_frame_chunks(int sockfd, const sockaddr_in& dest,
         size_t chunk_len = std::min((size_t)MAX_CHUNK_SIZE, (size_t)(dataSize - offset));
 
         PacketHeader hdr;
+        // convert data to network packet endianness
         hdr.frame_id = htonl(frame_id);
         hdr.chunk_index = htons(chunk_idx);
         hdr.total_chunks = htons(total_chunks);
         hdr.data_size = htonl((uint32_t)chunk_len);
         hdr.stream_type = stream_type;
+        hdr.mode = mode;
         memset(hdr.reserved, 0, sizeof(hdr.reserved));
 
         std::vector<uint8_t> packet(sizeof(PacketHeader) + chunk_len);
@@ -74,147 +87,205 @@ void send_frame_chunks(int sockfd, const sockaddr_in& dest,
     }
 }
 
-void camera_thread() {
-    try {
-        ob::Pipeline pipe;
-        auto device = pipe.getDevice();
-        std::cout << "[CAM] Device: " << device->getDeviceInfo()->name() << std::endl;
-
-        std::shared_ptr<ob::StreamProfile> colorProfile = nullptr;
-        std::shared_ptr<ob::StreamProfile> depthProfile = nullptr;
-        auto sensorList = device->getSensorList();
-        
-        // === find matching color profiles ===
-        for (uint32_t i = 0; i < sensorList->count(); i++) {
-            auto sensor = sensorList->getSensor(i);
-            auto profiles = sensor->getStreamProfileList();
-
-            if (sensor->getType() == OB_SENSOR_COLOR) {
-                for (uint32_t j = 0; j < profiles->count(); j++) {
-                    auto p = profiles->getProfile(j);
-                    auto vp = p->as<ob::VideoStreamProfile>();
-                    if (vp && vp->width() == COLOR_WIDTH && vp->height() == COLOR_HEIGHT
-                        && vp->fps() == COLOR_FPS && vp->format() == OB_FORMAT_MJPEG) {
-                        colorProfile = p;
-                        std::cout << "[CAM] Color: " << COLOR_WIDTH << "x" << COLOR_HEIGHT
-                                  << " @" << COLOR_FPS << "fps MJPEG" << std::endl;
-                        break;
-                    }
-                }
-            }
-
-            if (sensor->getType() == OB_SENSOR_DEPTH) {
-                for (uint32_t j = 0; j < profiles->count(); j++) {
-                    auto p = profiles->getProfile(j);
-                    auto vp = p->as<ob::VideoStreamProfile>();
-                    if (vp && vp->width() == DEPTH_WIDTH && vp->height() == DEPTH_HEIGHT
-                        && vp->fps() == DEPTH_FPS && vp->format() == OB_FORMAT_Y16) {
-                        depthProfile = p;
-                        std::cout << "[CAM] Depth: " << DEPTH_WIDTH << "x" << DEPTH_HEIGHT
-                                  << " @" << DEPTH_FPS << "fps Y16" << std::endl;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!colorProfile) { std::cerr << "[CAM] Color profile not found!" << std::endl; return; }
-        if (!depthProfile) { std::cerr << "[CAM] Depth profile not found!" << std::endl; return; }
-
-        // === Configure Pipeline: BOTH streams + synchronized ===
-        auto config = std::make_shared<ob::Config>();
-        config->enableStream(colorProfile);
-        config->enableStream(depthProfile);
-        // Synchronized delivery: wait for BOTH color+depth before returning
-        config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
-
-        // === Setup UDP Socket ===
-        int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sockfd < 0) { std::cerr << "[NET] Socket creation failed!" << std::endl; return; }
-
-        // Increase send buffer for burst transmission
-        int sndbuf = 4 * 1024 * 1024;
-        setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-
-        sockaddr_in dest{};
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(UDP_PORT);
-        inet_pton(AF_INET, HOST_IP, &dest.sin_addr);
-
-        pipe.start(config);
-        std::cout << "[CAM] Dual-stream started → " << HOST_IP << ":" << UDP_PORT << std::endl;
-        std::cout << "========================================" << std::endl;
-
-        uint32_t frame_id = 0;
-        // === FPS Benchmark ===
-        uint32_t frames_sent = 0;
-        auto fps_start = std::chrono::steady_clock::now();
-        uint32_t total_frames_sent = 0;
-        uint64_t total_bytes_sent = 0;
-
-        while (keep_running) {
-            auto frameSet = pipe.waitForFrameset(100);
-            if (!frameSet) continue;
-
-            auto colorFrame = frameSet->colorFrame();
-            auto depthFrame = frameSet->depthFrame();
-
-            frame_id++;
-
-            // Send COLOR
-            if (colorFrame && colorFrame->format() == OB_FORMAT_MJPEG) {
-                const uint8_t* data = static_cast<const uint8_t*>(colorFrame->data());
-                uint32_t size = colorFrame->dataSize();
-                send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_COLOR);
-                total_bytes_sent += size;  // ✅ Track bytes
-            }
-
-            // Send DEPTH
-            if (depthFrame && depthFrame->format() == OB_FORMAT_Y16) {
-                const uint8_t* data = static_cast<const uint8_t*>(depthFrame->data());
-                uint32_t size = depthFrame->dataSize();
-                send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_DEPTH);
-                total_bytes_sent += size;  // ✅ Track bytes
-            }
-            
-            // Performance checks
-            frames_sent++;
-            total_frames_sent++;
-            auto now = std::chrono::steady_clock::now();
-            double elapsed_sec = std::chrono::duration<double>(now - fps_start).count();
-
-            if (elapsed_sec >= 1.0) {
-                double send_fps = frames_sent / elapsed_sec;
-                double mbps = (total_bytes_sent * 8.0) / (elapsed_sec * 1'000'000.0);
-                
-                std::cout << "[BENCH] Send FPS: " << send_fps 
-                        << " | Total sent: " << total_frames_sent << " frames"
-                        << " | Bandwidth: " << mbps << " Mbps"
-                        << std::endl;
-                
-                // Reset per-second counters
-                frames_sent = 0;
-                total_bytes_sent = 0;
-                fps_start = now;
-            }
-            // Periodic status print
-            if (frame_id % 100 == 0) {
-                std::cout << "[CAM] Sent " << frame_id << " synchronized frame pairs" << std::endl;
-            }
-        }
-
-        pipe.stop();
-        close(sockfd);
-    } catch (const std::exception& e) {
-        std::cerr << "[CAM ERROR] " << e.what() << std::endl;
+// === Command Listener Thread ===
+void command_thread() {
+    int cmd_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (cmd_sock < 0) {
+        std::cerr << "[CMD] Socket creation failed!" << std::endl;
+        return;
     }
+
+    // set options: REUSEADDR (fast rebinding) and SO_RCVTIMEO (200ms timeout)
+    int opt = 1;
+    setsockopt(cmd_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000;
+    setsockopt(cmd_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // bind socket to port
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(COMMAND_PORT);
+
+    if (bind(cmd_sock, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cerr << "[CMD] Bind failed on port " << COMMAND_PORT << std::endl;
+        close(cmd_sock);
+        return;
+    }
+
+    std::cout << "[CMD] Listening on port " << COMMAND_PORT << std::endl;
+
+    char buf[64];
+    while (keep_running) {
+        ssize_t n = recv(cmd_sock, buf, sizeof(buf) - 1, 0);
+        if (n <= 0) continue;
+
+        buf[n] = '\0';
+        std::string cmd(buf);
+
+        // Trim whitespace/newline
+        while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r' || cmd.back() == ' '))
+            cmd.pop_back();
+
+        if (cmd == "CLOSE" && active_mode.load() != MODE_CLOSE) {
+            std::cout << "[CMD] Received: CLOSE → switching to 1080p@30" << std::endl;
+            requested_mode.store(MODE_CLOSE);
+        } else if (cmd == "FAR" && active_mode.load() != MODE_FAR) {
+            std::cout << "[CMD] Received: FAR → switching to 4K@25" << std::endl;
+            requested_mode.store(MODE_FAR);
+        }
+    }
+    close(cmd_sock);
+}
+
+// === Camera Thread ===
+void camera_thread() {
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0) { std::cerr << "[NET] Socket failed!" << std::endl; return; }
+
+    // make big 4MB buffer
+    int sndbuf = 4 * 1024 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(STREAM_PORT);
+    inet_pton(AF_INET, HOST_IP, &dest.sin_addr);
+
+    uint32_t frame_id = 0;
+
+    // FPS benchmark
+    uint32_t frames_sent = 0;
+    uint64_t total_bytes_sent = 0;
+    auto fps_start = std::chrono::steady_clock::now();
+
+    while (keep_running) {
+        // Apply mode switch if requested
+        int current_mode = requested_mode.load();
+        active_mode.store(current_mode);
+        ModeConfig cfg = get_mode_config(current_mode);
+
+        try {
+            ob::Pipeline pipe;
+            auto device = pipe.getDevice();
+
+            std::shared_ptr<ob::StreamProfile> colorProfile = nullptr;
+            std::shared_ptr<ob::StreamProfile> depthProfile = nullptr;
+            auto sensorList = device->getSensorList();
+
+            for (uint32_t i = 0; i < sensorList->count(); i++) {
+                auto sensor = sensorList->getSensor(i);
+                auto profiles = sensor->getStreamProfileList();
+
+                if (sensor->getType() == OB_SENSOR_COLOR) {
+                    for (uint32_t j = 0; j < profiles->count(); j++) {
+                        auto p = profiles->getProfile(j);
+                        auto vp = p->as<ob::VideoStreamProfile>();
+                        if (vp && vp->width() == cfg.color_w && vp->height() == cfg.color_h
+                            && vp->fps() == cfg.color_fps && vp->format() == OB_FORMAT_MJPEG) {
+                            colorProfile = p;
+                            break;
+                        }
+                    }
+                }
+                if (sensor->getType() == OB_SENSOR_DEPTH) {
+                    for (uint32_t j = 0; j < profiles->count(); j++) {
+                        auto p = profiles->getProfile(j);
+                        auto vp = p->as<ob::VideoStreamProfile>();
+                        if (vp && vp->width() == cfg.depth_w && vp->height() == cfg.depth_h
+                            && vp->fps() == cfg.depth_fps && vp->format() == OB_FORMAT_Y16) {
+                            depthProfile = p;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!colorProfile || !depthProfile) {
+                std::cerr << "[CAM] Profile not found for mode " << current_mode << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+
+            auto config = std::make_shared<ob::Config>();
+            config->enableStream(colorProfile);
+            config->enableStream(depthProfile);
+            config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+
+            pipe.start(config);
+            std::cout << "[CAM] Streaming: " << cfg.color_w << "x" << cfg.color_h
+                      << "@" << cfg.color_fps << " + "
+                      << cfg.depth_w << "x" << cfg.depth_h
+                      << "@" << cfg.depth_fps
+                      << " → " << HOST_IP << ":" << STREAM_PORT << std::endl;
+
+            // === Frame loop ===
+            while (keep_running && requested_mode.load() == current_mode) {
+                auto frameSet = pipe.waitForFrameset(100);
+                if (!frameSet) continue;
+
+                auto colorFrame = frameSet->colorFrame();
+                auto depthFrame = frameSet->depthFrame();
+                frame_id++;
+
+                if (colorFrame && colorFrame->format() == OB_FORMAT_MJPEG) {
+                    const uint8_t* data = static_cast<const uint8_t*>(colorFrame->data());
+                    uint32_t size = colorFrame->dataSize();
+                    send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_COLOR, current_mode);
+                    total_bytes_sent += size;
+                }
+
+                if (depthFrame && depthFrame->format() == OB_FORMAT_Y16) {
+                    const uint8_t* data = static_cast<const uint8_t*>(depthFrame->data());
+                    uint32_t size = depthFrame->dataSize();
+                    send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_DEPTH, current_mode);
+                    total_bytes_sent += size;
+                }
+
+                frames_sent++;
+
+                // FPS benchmark (every 1 second)
+                auto now = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(now - fps_start).count();
+                if (elapsed >= 1.0) {
+                    double fps = frames_sent;
+                    double mbps = (total_bytes_sent * 8.0 / 1024 / 1024);
+                    std::cout << "[BENCH] "
+                              << (current_mode == MODE_FAR ? "FAR(4K@25)" : "CLOSE(1080p@30)")
+                              << " | FPS: " << fps
+                              << " | Bandwidth: " << mbps << " Mbps"
+                              << " | Frames: " << frame_id
+                              << std::endl;
+                    frames_sent = 0;
+                    total_bytes_sent = 0;
+                    fps_start = now;
+                }
+            }
+
+            pipe.stop();
+            std::cout << "[CAM] Pipeline stopped (mode switch)" << std::endl;
+
+        } catch (const std::exception& e) {
+            std::cerr << "[CAM ERROR] " << e.what() << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
+
+    close(sockfd);
 }
 
 int main() {
     std::thread cam_thread(camera_thread);
-    std::cout << "Press Enter to stop..." << std::endl;
+    std::thread cmd_thread(command_thread);
+
+    std::cout << "Adaptive stream server. Press Enter to stop..." << std::endl;
     std::cin.get();
     keep_running = false;
+
     cam_thread.join();
+    cmd_thread.join();
     return 0;
 }
