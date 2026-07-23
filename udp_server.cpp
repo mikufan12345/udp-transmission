@@ -10,6 +10,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <signal.h>
 
 // ============================================================
 // CONFIGURATION
@@ -334,11 +335,20 @@ void camera_thread() {
 }
 
 int main() {
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTERM);
+    sigaddset(&set, SIGINT);
+    sigprocmask(SIG_BLOCK, &set, nullptr);
+
     std::thread cam_thread(camera_thread);
     std::thread cmd_thread(command_thread);
 
-    std::cout << "Adaptive stream server. Press Enter to stop..." << std::endl;
-    std::cin.get();
+    std::cout << "Adaptive stream server running. Waiting for SIGTERM/SIGINT to stop..." << std::endl;
+
+    int sig;
+    sigwait(&set, &sig);
+    std::cout << "Received signal " << sig << ", shutting down..." << std::endl;
     keep_running = false;
 
     cam_thread.join();

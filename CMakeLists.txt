@@ -8,18 +8,7 @@ set(OB_SDK_ROOT "/home/orb/Desktop/sdk/OrbbecSDK_v2.9.3_202607151523_2f6561c_lin
 set(OB_INCLUDE_DIR "${OB_SDK_ROOT}/include")
 find_library(OB_LIBRARY NAMES OrbbecSDK obsensor PATHS "${OB_SDK_ROOT}/lib" "${OB_SDK_ROOT}/lib/aarch64" NO_DEFAULT_PATH)
 
-add_executable(mjpg_server mjpg_server.cpp)
-target_include_directories(mjpg_server PRIVATE ${OB_INCLUDE_DIR})
-target_link_libraries(mjpg_server PRIVATE ${OB_LIBRARY} pthread)
-
-set_target_properties(mjpg_server PROPERTIES
-    BUILD_RPATH "${OB_SDK_ROOT}/lib"
-    INSTALL_RPATH "${OB_SDK_ROOT}/lib"
-    BUILD_WITH_INSTALL_RPATH TRUE
-)
-
-
-add_executable(udp_streamer chunked_udp_server.cpp)
+add_executable(udp_streamer udp_server.cpp)
 target_include_directories(udp_streamer PRIVATE ${OB_INCLUDE_DIR})
 
 # pthread is required for std::thread and std::atomic
