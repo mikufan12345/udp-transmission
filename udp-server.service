@@ -1,0 +1,13 @@
+[Unit]
+Description=UDP server for UDP receiver. see https://github.com/mikufan12345/udp-transmission
+After=network.target
+
+[Service]
+User=orb
+WorkingDirectory=/home/orb/udp-transmission/
+ExecStart=/home/orb/udp-transmission/build/udp_streamer
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
