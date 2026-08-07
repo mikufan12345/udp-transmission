@@ -24,3 +24,7 @@ set_target_properties(udp_streamer PROPERTIES
 add_executable(list_profiles list_profiles.cpp)
 target_include_directories(list_profiles PRIVATE ${OB_INCLUDE_DIR})
 target_link_libraries(list_profiles PRIVATE ${OB_LIBRARY} pthread)
+
+add_executable(get_intrinsics get_intrinsics.cpp)
+target_include_directories(get_intrinsics PRIVATE ${OB_INCLUDE_DIR})
+target_link_libraries(get_intrinsics PRIVATE ${OB_LIBRARY} pthread)
