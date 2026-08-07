@@ -60,9 +60,9 @@ int main() try {
         std::cout << std::endl;
     }
     std::cout << "  translation (x, y, z):" << std::endl;
-    std::cout << "    " << camParam.transform.transform[0]
-              << ", " << camParam.transform.transform[1]
-              << ", " << camParam.transform.transform[2]
+    std::cout << "    " << camParam.transform.trans[0]
+              << ", " << camParam.transform.trans[1]
+              << ", " << camParam.transform.trans[2]
               << std::endl;
 
     std::cout << "\n========================================" << std::endl;
@@ -88,9 +88,9 @@ int main() try {
     }
     std::cout << ")" << std::endl;
     std::cout << "_DEPTH_TO_COLOR_TRANSLATION = ("
-              << camParam.transform.transform[0] << ", "
-              << camParam.transform.transform[1] << ", "
-              << camParam.transform.transform[2] << ")"
+              << camParam.transform.trans[0] << ", "
+              << camParam.transform.trans[1] << ", "
+              << camParam.transform.trans[2] << ")"
               << std::endl;
 
     return 0;
