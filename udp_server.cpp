@@ -276,20 +276,48 @@ void camera_thread() {
                 frame_id++;
                 auto startSend = std::chrono::steady_clock::now();
 
-                if (colorFrame && colorFrame->format() == OB_FORMAT_MJPEG) {
-                    const uint8_t* data = static_cast<const uint8_t*>(colorFrame->data());
-                    uint32_t size = colorFrame->dataSize();
-                    send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_COLOR, current_mode);
-                    total_bytes_sent += size;
-                    cached_color.assign(data, data+size);
-                }
+                // Upload colour and depth concurrently so a stall on one stream
+                // (JPEG copy / sendto) never delays the start of the other. The
+                // receiver only completes a frame once BOTH chunk sets are in,
+                // so running them on separate threads shrinks the gap between the
+                // colour tail and the depth tail, which flattens the end-of-frame
+                // arrival jitter observed on the receiver side.
+                {
+                    // Capture by value so neither thread races the main loop's
+                    // frame_id increment. Multiple sendto() on one UDP socket is
+                    // safe concurrently on Linux.
+                    const uint32_t fid = frame_id;
+                    const uint8_t* cdata = nullptr;
+                    uint32_t csize = 0;
+                    const uint8_t* ddata = nullptr;
+                    uint32_t dsize = 0;
+                    if (colorFrame) {
+                        cdata = static_cast<const uint8_t*>(colorFrame->data());
+                        csize = colorFrame->dataSize();
+                    }
+                    if (depthFrame && depthFrame->format() == OB_FORMAT_Y16) {
+                        ddata = static_cast<const uint8_t*>(depthFrame->data());
+                        dsize = depthFrame->dataSize();
+                    }
 
-                if (depthFrame && depthFrame->format() == OB_FORMAT_Y16) {
-                    const uint8_t* data = static_cast<const uint8_t*>(depthFrame->data());
-                    uint32_t size = depthFrame->dataSize();
-                    send_frame_chunks(sockfd, dest, data, size, frame_id, STREAM_DEPTH, current_mode);
-                    total_bytes_sent += size;
-                    cached_depth.assign(data, data+size);
+                    std::thread ct;
+                    std::thread dt;
+                    if (cdata) {
+                        ct = std::thread([&, cdata, csize, fid]() {
+                            send_frame_chunks(sockfd, dest, cdata, csize, fid, STREAM_COLOR, current_mode);
+                        });
+                    }
+                    if (ddata) {
+                        dt = std::thread([&, ddata, dsize, fid]() {
+                            send_frame_chunks(sockfd, dest, ddata, dsize, fid, STREAM_DEPTH, current_mode);
+                        });
+                    }
+                    if (ct.joinable()) ct.join();
+                    if (dt.joinable()) dt.join();
+
+                    total_bytes_sent += csize + dsize;
+                    if (cdata) cached_color.assign(cdata, cdata + csize);
+                    if (ddata) cached_depth.assign(ddata, ddata + dsize);
                 }
 
                 frames_sent++;
