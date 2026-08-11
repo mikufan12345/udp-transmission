@@ -205,6 +205,14 @@ void camera_thread() {
     std::vector<uint8_t> cached_depth;
     uint32_t cached_frame_id = 0;
 
+    // Frame-interval diagnostic: measures the delta between consecutive
+    // waitForFrameset() returns (the camera's own frame cadence). If this
+    // p95 is ~40ms while the raw receive-side gap is ~40ms, the residual
+    // jitter is the Orbbec camera clock, not the sender upload or socket.
+    static const size_t DIAG_WINDOW = 600; // ~20 s at 30 fps
+    std::vector<float> frame_intervals;    // ms, capped at DIAG_WINDOW
+    std::chrono::steady_clock::time_point prev_frame_start;
+
     while (keep_running) {
         // Apply mode switch if requested
         int current_mode = requested_mode.load();
@@ -268,8 +276,20 @@ void camera_thread() {
 
             // === Frame loop ===
             while (keep_running && requested_mode.load() == current_mode) {
+                auto frame_t0 = std::chrono::steady_clock::now();
                 auto frameSet = pipe.waitForFrameset(100);
                 if (!frameSet) continue;
+
+                // Record the camera frame-cadence delta (only once we have a
+                // previous frame to measure against).
+                if (frame_id > 0) {
+                    float dt_ms = std::chrono::duration<float, std::milli>(
+                        frame_t0 - prev_frame_start).count();
+                    frame_intervals.push_back(dt_ms);
+                    if (frame_intervals.size() > DIAG_WINDOW)
+                        frame_intervals.erase(frame_intervals.begin());
+                }
+                prev_frame_start = frame_t0;
 
                 auto colorFrame = frameSet->colorFrame();
                 auto depthFrame = frameSet->depthFrame();
@@ -334,8 +354,21 @@ void camera_thread() {
                               << " | FPS: " << fps
                               << " | Bandwidth: " << mbps << " Mbps"
                               << " | Frames: " << frame_id
-                              << " | Time used: " << std::chrono::duration<double>(endSend - startSend).count()
-                              << std::endl;
+                              << " | Time used: " << std::chrono::duration<double>(endSend - startSend).count();
+                    // Camera frame-cadence jitter: avg + p95 of interval between
+                    // consecutive waitForFrameset returns. Compares directly to
+                    // the receiver's on-the-wire "gap p95".
+                    if (frame_intervals.size() >= 30) {
+                        std::vector<float> sorted = frame_intervals;
+                        std::sort(sorted.begin(), sorted.end());
+                        float sum = 0.0f;
+                        for (float v : sorted) sum += v;
+                        float avg = sum / sorted.size();
+                        float p95 = sorted[size_t(sorted.size() * 0.95)];
+                        std::cout << " | cam_interval_avg=" << avg
+                                  << " cam_interval_p95=" << p95;
+                    }
+                    std::cout << std::endl;
                     frames_sent = 0;
                     total_bytes_sent = 0;
                     fps_start = now;
