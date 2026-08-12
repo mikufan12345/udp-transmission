@@ -201,9 +201,6 @@ void camera_thread() {
     uint32_t frames_sent = 0;
     uint64_t total_bytes_sent = 0;
     auto fps_start = std::chrono::steady_clock::now();
-    std::vector<uint8_t> cached_color;
-    std::vector<uint8_t> cached_depth;
-    uint32_t cached_frame_id = 0;
 
     // Frame-interval diagnostic: measures the delta between consecutive
     // waitForFrameset() returns (the camera's own frame cadence). If this
@@ -272,6 +269,12 @@ void camera_thread() {
             config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ANY_SITUATION);
 
             pipe.start(config);
+            // Verify pipeline started successfully
+            if (!pipe.isStarted()) {
+                std::cerr << "[CAM] pipe.start() failed for mode " << current_mode << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
+            }
             is_switching.store(false);
             std::cout << "[CAM] Streaming: " << cfg.color_w << "x" << cfg.color_h
                       << "@" << cfg.color_fps << " + "
@@ -279,11 +282,24 @@ void camera_thread() {
                       << "@" << cfg.depth_fps
                       << " → " << HOST_IP << ":" << STREAM_PORT << std::endl;
 
+            // Watchdog: track last successful frame time
+            auto last_frame_time = std::chrono::steady_clock::now();
+
             // === Frame loop ===
             while (keep_running && requested_mode.load() == current_mode) {
                 auto frame_t0 = std::chrono::steady_clock::now();
                 auto frameSet = pipe.waitForFrameset(100);
-                if (!frameSet) continue;
+                
+                // Watchdog: no frames for 3 seconds -> break to restart pipeline
+                if (!frameSet) {
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_frame_time).count() > 3) {
+                        std::cerr << "[CAM] Watchdog: no frames for 3s, breaking to restart pipeline" << std::endl;
+                        break;
+                    }
+                    continue;
+                }
+                last_frame_time = frame_t0;
 
                 // Record the camera frame-cadence delta (only once we have a
                 // previous frame to measure against).
