@@ -269,12 +269,6 @@ void camera_thread() {
             config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ANY_SITUATION);
 
             pipe.start(config);
-            // Verify pipeline started successfully
-            if (!pipe.isStarted()) {
-                std::cerr << "[CAM] pipe.start() failed for mode " << current_mode << std::endl;
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
-            }
             is_switching.store(false);
             std::cout << "[CAM] Streaming: " << cfg.color_w << "x" << cfg.color_h
                       << "@" << cfg.color_fps << " + "
