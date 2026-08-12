@@ -1,3 +1,7 @@
+// sendmmsg()/mmsghdr are GNU extensions in glibc headers; ensure they are
+// declared even under a strict -std=c++17 build.
+#define _GNU_SOURCE
+
 #include <libobsensor/ObSensor.hpp>
 #include <iostream>
 #include <thread>
@@ -7,10 +11,13 @@
 #include <vector>
 #include <algorithm>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <signal.h>
+#include <errno.h>
+#include <condition_variable>
 
 // ============================================================
 // CONFIGURATION
@@ -18,7 +25,9 @@
 #define HOST_IP             "192.168.0.249"
 #define STREAM_PORT         9999    // Video stream (out)
 #define COMMAND_PORT        9998    // Mode switch commands (in)
-#define MAX_CHUNK_SIZE      60000
+#define MAX_CHUNK_SIZE      1400    // Fit single MTU (1500 - IP/UDP headers)
+#define SEND_BATCH          32      // Datagrams per sendmmsg call
+#define RING_SLOTS          2       // Capture <-> network handoff slots
 // ============================================================
 
 #define STREAM_COLOR  0
@@ -50,6 +59,26 @@ std::vector<uint8_t> cached_depth;
 uint32_t cached_frame_id = 0;
 int cached_mode = MODE_CLOSE;
 
+// === Frame handoff ring (camera capture -> network sender) ===
+// The capture thread copies the latest color/depth buffers into a free ring
+// slot; the network thread swaps the slot out of the ring (O(1) vector swap
+// under the mutex) and drains it with sendmmsg batches. This decouples camera
+// capture from blocking socket sends so a slow receiver never stalls the SDK.
+struct FrameBuffer {
+    std::vector<uint8_t> color;
+    std::vector<uint8_t> depth;
+    uint32_t frame_id = 0;
+    uint8_t mode = MODE_CLOSE;
+};
+
+static FrameBuffer ring[RING_SLOTS];
+static std::mutex ring_mtx;
+static std::condition_variable ring_produce_cv;  // producer waits: a slot is free
+static std::condition_variable ring_consume_cv;  // consumer waits: a frame is ready
+static int ring_count = 0;
+static int ring_head = 0;  // next slot the consumer will drain
+static int ring_tail = 0;  // next slot the producer will fill
+
 struct ModeConfig {
     int color_w, color_h, color_fps;
     int depth_w, depth_h, depth_fps;
@@ -62,35 +91,141 @@ ModeConfig get_mode_config(int mode) {
 }
 
 // === UDP Chunk Sender ===
+// Sends one frame as total_chunks datagrams using sendmmsg batching over a
+// zero-copy iovec (stack header + direct camera-buffer pointer). No per-chunk
+// heap allocation, no payload memcpy. A 4K frame (~1500 chunks) costs ~47
+// syscalls instead of ~1500.
 void send_frame_chunks(int sockfd, const sockaddr_in& dest,
                        const uint8_t* data, uint32_t dataSize,
                        uint32_t frame_id, uint8_t stream_type, uint8_t mode) {
+    if (dataSize == 0) return;
     uint16_t total_chunks = (dataSize + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE;
+
+    mmsghdr msgs[SEND_BATCH];
+    iovec   iov[SEND_BATCH * 2];
+    PacketHeader hdr[SEND_BATCH];
+
     size_t offset = 0;
     uint16_t chunk_idx = 0;
-    
+    int in_batch = 0;
+
     while (offset < dataSize) {
         size_t chunk_len = std::min((size_t)MAX_CHUNK_SIZE, (size_t)(dataSize - offset));
-        
-        PacketHeader hdr;
-        // convert data to network packet endianness
-        hdr.frame_id = htonl(frame_id);
-        hdr.chunk_index = htons(chunk_idx);
-        hdr.total_chunks = htons(total_chunks);
-        hdr.data_size = htonl((uint32_t)chunk_len);
-        hdr.stream_type = stream_type;
-        hdr.mode = mode;
-        memset(hdr.reserved, 0, sizeof(hdr.reserved));
-        
-        std::vector<uint8_t> packet(sizeof(PacketHeader) + chunk_len);
-        memcpy(packet.data(), &hdr, sizeof(hdr));
-        memcpy(packet.data() + sizeof(hdr), data + offset, chunk_len);
-        
-        sendto(sockfd, packet.data(), packet.size(), 0,
-        reinterpret_cast<const struct sockaddr*>(&dest), sizeof(dest));
 
-        offset += chunk_len;
+        PacketHeader& h = hdr[in_batch];
+        h.frame_id = htonl(frame_id);
+        h.chunk_index = htons(chunk_idx);
+        h.total_chunks = htons(total_chunks);
+        h.data_size = htonl((uint32_t)chunk_len);
+        h.stream_type = stream_type;
+        h.mode = mode;
+        memset(h.reserved, 0, sizeof(h.reserved));
+
+        iov[in_batch * 2]     = { (void*)(&h), sizeof(h) };
+        iov[in_batch * 2 + 1] = { (void*)(data + offset), chunk_len };
+
+        msgs[in_batch].msg_hdr.msg_name = const_cast<sockaddr_in*>(&dest);
+        msgs[in_batch].msg_hdr.msg_namelen = sizeof(dest);
+        msgs[in_batch].msg_hdr.msg_iov = &iov[in_batch * 2];
+        msgs[in_batch].msg_hdr.msg_iovlen = 2;
+        msgs[in_batch].msg_hdr.msg_control = nullptr;
+        msgs[in_batch].msg_hdr.msg_controllen = 0;
+        msgs[in_batch].msg_hdr.msg_flags = 0;
+        msgs[in_batch].msg_len = 0;
+
+        in_batch++;
         chunk_idx++;
+        offset += chunk_len;
+
+        if (in_batch == SEND_BATCH || offset >= dataSize) {
+            size_t sent = 0;
+            while (sent < (size_t)in_batch) {
+                ssize_t n = sendmmsg(sockfd, msgs + sent, in_batch - (int)sent, 0);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    return;  // fatal socket error — drop the rest of this frame
+                }
+                sent += (size_t)n;
+            }
+            in_batch = 0;
+        }
+    }
+}
+
+// === Network sender thread ===
+// Drains frames handed off by the camera thread and pushes them to the wire.
+// Blocking socket sends live here only, so a slow receiver backpressures this
+// thread (and, at worst, the ring) instead of stalling waitForFrameset.
+void network_thread(int sockfd, const sockaddr_in& dest) {
+    FrameBuffer outgoing;  // reused drain buffer — vectors swap O(1) from the ring
+
+    // FPS benchmark
+    uint32_t frames_sent = 0;
+    uint64_t total_bytes_sent = 0;
+    auto fps_start = std::chrono::steady_clock::now();
+    std::vector<float> drain_times;
+    static const size_t DRAIN_WINDOW = 600;
+
+    while (keep_running) {
+        {
+            std::unique_lock<std::mutex> lk(ring_mtx);
+            ring_consume_cv.wait(lk, [&] {
+                return ring_count > 0 || !keep_running.load();
+            });
+            if (ring_count == 0) break;   // shutdown with nothing left to send
+            FrameBuffer& src = ring[ring_head];
+            ring_head = (ring_head + 1) % RING_SLOTS;
+            ring_count--;
+            outgoing.color.swap(src.color);
+            outgoing.depth.swap(src.depth);
+            outgoing.frame_id = src.frame_id;
+            outgoing.mode = src.mode;
+        }
+        ring_produce_cv.notify_one();
+
+        auto startSend = std::chrono::steady_clock::now();
+        if (!outgoing.color.empty()) {
+            send_frame_chunks(sockfd, dest, outgoing.color.data(),
+                              (uint32_t)outgoing.color.size(),
+                              outgoing.frame_id, STREAM_COLOR, outgoing.mode);
+            total_bytes_sent += outgoing.color.size();
+        }
+        if (!outgoing.depth.empty()) {
+            send_frame_chunks(sockfd, dest, outgoing.depth.data(),
+                              (uint32_t)outgoing.depth.size(),
+                              outgoing.frame_id, STREAM_DEPTH, outgoing.mode);
+            total_bytes_sent += outgoing.depth.size();
+        }
+        auto endSend = std::chrono::steady_clock::now();
+        float drain_ms = std::chrono::duration<float, std::milli>(
+            endSend - startSend).count();
+        drain_times.push_back(drain_ms);
+        if (drain_times.size() > DRAIN_WINDOW)
+            drain_times.erase(drain_times.begin());
+
+        frames_sent++;
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - fps_start).count();
+        if (elapsed >= 1.0) {
+            double mbps = total_bytes_sent * 8.0 / 1024 / 1024;
+            std::cout << "[BENCH] "
+                      << (outgoing.mode == MODE_FAR ? "FAR(4K@25)" : "CLOSE(1080p@30)")
+                      << " | FPS: " << frames_sent
+                      << " | Bandwidth: " << mbps << " Mbps"
+                      << " | Frames: " << outgoing.frame_id;
+            if (drain_times.size() >= 30) {
+                std::vector<float> sorted = drain_times;
+                std::sort(sorted.begin(), sorted.end());
+                float sum = 0.0f;
+                for (float v : sorted) sum += v;
+                std::cout << " | drain_avg=" << (sum / sorted.size())
+                          << " drain_p95=" << sorted[size_t(sorted.size() * 0.95)];
+            }
+            std::cout << std::endl;
+            frames_sent = 0;
+            total_bytes_sent = 0;
+            fps_start = now;
+        }
     }
 }
 
@@ -196,11 +331,12 @@ void camera_thread() {
 
     uint32_t frame_id = 0;
     std::thread frz_thread(freeze_thread, sockfd, dest);
+    std::thread net_thread(network_thread, sockfd, dest);
 
-    // FPS benchmark
-    uint32_t frames_sent = 0;
-    uint64_t total_bytes_sent = 0;
-    auto fps_start = std::chrono::steady_clock::now();
+    // Capture-side benchmark: counts frames handed to the network thread only.
+    // Wire FPS / bandwidth / drain time are reported by network_thread.
+    uint32_t frames_captured = 0;
+    auto cam_fps_start = std::chrono::steady_clock::now();
 
     // Frame-interval diagnostic: measures the delta between consecutive
     // waitForFrameset() returns (the camera's own frame cadence). If this
@@ -279,11 +415,20 @@ void camera_thread() {
             // Watchdog: track last successful frame time
             auto last_frame_time = std::chrono::steady_clock::now();
 
+            // Freeze-frame cache lite refresh: while streaming we do NOT copy
+            // every frame into the cache (that was a hot-path memcpy). Instead
+            // we refresh it every CACHE_REFRESH_FRAMES so a mode switch's
+            // freeze-bridge always re-sends a fresh-ish frame (<=1s stale).
+            const int CACHE_REFRESH_FRAMES = 30;
+            int cache_refresh_counter = 0;
+
             // === Frame loop ===
-            while (keep_running && requested_mode.load() == current_mode) {
+            while (keep_running) {
+                if (requested_mode.load() != current_mode) break;  // mode switch
+
                 auto frame_t0 = std::chrono::steady_clock::now();
                 auto frameSet = pipe.waitForFrameset(100);
-                
+
                 // Watchdog: no frames for 3 seconds -> break to restart pipeline
                 if (!frameSet) {
                     auto now = std::chrono::steady_clock::now();
@@ -307,76 +452,90 @@ void camera_thread() {
                 prev_frame_start = frame_t0;
 
                 // ANY_SITUATION: the FrameSet may carry colour only, depth only,
-                // or both. Each stream is sent immediately when it appears under
-                // the same pair frame_id; the receiver releases on colour and
-                // attaches the freshest complete depth, so a ~1-frame depth
-                // trail is fine for the native scalar sampling.
+                // or both. Each stream is handed off under the same pair frame_id;
+                // the receiver releases on colour and attaches the freshest
+                // complete depth.
                 auto colorFrame = frameSet->colorFrame();
                 auto depthFrame = frameSet->depthFrame();
                 if (!colorFrame && !depthFrame) {
                     continue;   // nothing to send this frameset
                 }
                 frame_id++;
-                auto startSend = std::chrono::steady_clock::now();
                 const uint32_t fid = frame_id;
 
+                const uint8_t* cdata = nullptr; uint32_t csize = 0;
+                const uint8_t* ddata = nullptr; uint32_t dsize = 0;
                 if (colorFrame) {
-                    const uint8_t* cdata = static_cast<const uint8_t*>(colorFrame->data());
-                    const uint32_t csize = colorFrame->dataSize();
-                    send_frame_chunks(sockfd, dest, cdata, csize, fid, STREAM_COLOR, current_mode);
-                    total_bytes_sent += csize;
-                    cached_color.assign(cdata, cdata + csize);
+                    cdata = static_cast<const uint8_t*>(colorFrame->data());
+                    csize = colorFrame->dataSize();
                 }
                 if (depthFrame && depthFrame->format() == OB_FORMAT_Y16) {
-                    const uint8_t* ddata = static_cast<const uint8_t*>(depthFrame->data());
-                    const uint32_t dsize = depthFrame->dataSize();
-                    send_frame_chunks(sockfd, dest, ddata, dsize, fid, STREAM_DEPTH, current_mode);
-                    total_bytes_sent += dsize;
-                    cached_depth.assign(ddata, ddata + dsize);
+                    ddata = static_cast<const uint8_t*>(depthFrame->data());
+                    dsize = depthFrame->dataSize();
                 }
 
-                frames_sent++;
-                auto endSend = std::chrono::steady_clock::now();
+                // Mode switch now pending: snapshot this final frame into the
+                // freeze-frame cache and stop this pipeline. The cache is only
+                // refreshed at switch time — no per-frame copy during streaming.
+                if (requested_mode.load() != current_mode) {
+                    std::lock_guard<std::mutex> lock(cache_mutex);
+                    cached_mode = current_mode;
+                    if (colorFrame) cached_color.assign(cdata, cdata + csize);
+                    if (depthFrame) cached_depth.assign(ddata, ddata + dsize);
+                    break;
+                }
 
-                // FPS benchmark (every 1 second)
+                // Copy into a free ring slot and hand off to the network thread.
+                // The copy replaces the old per-frame cached_* cache write.
+                {
+                    std::unique_lock<std::mutex> lk(ring_mtx);
+                    ring_produce_cv.wait(lk, [&] {
+                        return ring_count < RING_SLOTS || !keep_running.load();
+                    });
+                    if (!keep_running) break;
+                    FrameBuffer& dst = ring[ring_tail];
+                    ring_tail = (ring_tail + 1) % RING_SLOTS;
+                    dst.frame_id = fid;
+                    dst.mode = current_mode;
+                    if (colorFrame) dst.color.assign(cdata, cdata + csize);
+                    if (depthFrame) dst.depth.assign(ddata, ddata + dsize);
+                    ring_count++;
+                }
+                ring_consume_cv.notify_one();
+
+                // Lite cache refresh (see CACHE_REFRESH_FRAMES above).
+                if (++cache_refresh_counter >= CACHE_REFRESH_FRAMES) {
+                    cache_refresh_counter = 0;
+                    std::lock_guard<std::mutex> lock(cache_mutex);
+                    cached_mode = current_mode;
+                    if (colorFrame) cached_color.assign(cdata, cdata + csize);
+                    if (depthFrame) cached_depth.assign(ddata, ddata + dsize);
+                }
+
+                frames_captured++;
+                // Capture-fps diagnostic (every 1 second)
                 auto now = std::chrono::steady_clock::now();
-                double elapsed = std::chrono::duration<double>(now - fps_start).count();
+                double elapsed = std::chrono::duration<double>(now - cam_fps_start).count();
                 if (elapsed >= 1.0) {
-                    double fps = frames_sent;
-                    double mbps = (total_bytes_sent * 8.0 / 1024 / 1024);
-                    std::cout << "[BENCH] "
-                              << (current_mode == MODE_FAR ? "FAR(4K@25)" : "CLOSE(1080p@30)")
-                              << " | FPS: " << fps
-                              << " | Bandwidth: " << mbps << " Mbps"
-                              << " | Frames: " << frame_id
-                              << " | Time used: " << std::chrono::duration<double>(endSend - startSend).count();
+                    std::cout << "[CAM] capture_fps=" << frames_captured;
                     // Camera frame-cadence jitter: avg + p95 of interval between
-                    // consecutive waitForFrameset returns. Compares directly to
-                    // the receiver's on-the-wire "gap p95".
+                    // consecutive waitForFrameset returns.
                     if (frame_intervals.size() >= 30) {
                         std::vector<float> sorted = frame_intervals;
                         std::sort(sorted.begin(), sorted.end());
                         float sum = 0.0f;
                         for (float v : sorted) sum += v;
-                        float avg = sum / sorted.size();
-                        float p95 = sorted[size_t(sorted.size() * 0.95)];
-                        std::cout << " | cam_interval_avg=" << avg
-                                  << " cam_interval_p95=" << p95;
+                        std::cout << " cam_interval_avg=" << (sum / sorted.size())
+                                  << " cam_interval_p95=" << sorted[size_t(sorted.size() * 0.95)];
                     }
                     std::cout << std::endl;
-                    frames_sent = 0;
-                    total_bytes_sent = 0;
-                    fps_start = now;
+                    frames_captured = 0;
+                    cam_fps_start = now;
                 }
             }
-            
+
             // switch the mode
             is_switching.store(true);   // start sending cached frames
-            // update cache with last frame
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex);
-                cached_mode = current_mode;
-            }
             pipe.stop();
             std::cout << "[CAM] Pipeline stopped (mode switch)" << std::endl;
 
@@ -386,7 +545,14 @@ void camera_thread() {
         }
     }
 
+    // Wake any thread still blocked on the ring so it can observe shutdown.
+    {
+        std::unique_lock<std::mutex> lk(ring_mtx);
+        ring_produce_cv.notify_all();
+        ring_consume_cv.notify_all();
+    }
     frz_thread.join();
+    net_thread.join();
     close(sockfd);
 }
 
@@ -406,6 +572,13 @@ int main() {
     sigwait(&set, &sig);
     std::cout << "Received signal " << sig << ", shutting down..." << std::endl;
     keep_running = false;
+    // Wake any capture/network thread blocked on the ring so they can observe
+    // the shutdown immediately (their wait predicates include keep_running).
+    {
+        std::lock_guard<std::mutex> lk(ring_mtx);
+        ring_produce_cv.notify_all();
+        ring_consume_cv.notify_all();
+    }
 
     cam_thread.join();
     cmd_thread.join();

@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.10)
 project(orbbec_mjpeg LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 
+# Default to a Release build so a plain `cmake ..` (as used by build.sh)
+# still compiles with the aggressive optimizations the hot send loop needs.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -flto")
+
 # note: OB_SDK_ROOT may change if you reset the thing, just double check before you compile for no errors
 # also ensure that you are using v2 SDK because you may get errors if not
 set(OB_SDK_ROOT "/home/orb/Desktop/sdk/OrbbecSDK_v2.9.3_202607151523_2f6561c_linux_arm64")
