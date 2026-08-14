@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <algorithm>
 #include <sys/socket.h>
@@ -17,6 +18,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <errno.h>
+#include <poll.h>
 #include <condition_variable>
 
 // ============================================================
@@ -262,21 +264,21 @@ void freeze_thread(int sockfd, const sockaddr_in& dest) {
 }
 
 // === Command Listener Thread ===
+// A TCP listener (was UDP) so a connect-per-command sender can push a
+// newline-terminated "CLOSE"/"FAR" command with delivery guarantees. The loop
+// poll()s the listening socket plus any connected clients so multiple hosts
+// can still send (as fire-and-forget UDP allowed before), while a 200ms poll
+// timeout keeps shutdown responsive to keep_running.
 void command_thread() {
-    int cmd_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int cmd_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (cmd_sock < 0) {
         std::cerr << "[CMD] Socket creation failed!" << std::endl;
         return;
     }
-    
-    // set options: REUSEADDR (fast rebinding) and SO_RCVTIMEO (200ms timeout)
+
+    // set options: REUSEADDR for fast rebinding
     int opt = 1;
     setsockopt(cmd_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;
-    setsockopt(cmd_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     // bind socket to port
     sockaddr_in addr{};
@@ -290,28 +292,113 @@ void command_thread() {
         return;
     }
 
-    std::cout << "[CMD] Listening on port " << COMMAND_PORT << std::endl;
+    if (listen(cmd_sock, 4) < 0) {
+        std::cerr << "[CMD] Listen failed on port " << COMMAND_PORT << std::endl;
+        close(cmd_sock);
+        return;
+    }
 
-    char buf[64];
-    while (keep_running) {
-        ssize_t n = recv(cmd_sock, buf, sizeof(buf) - 1, 0);
-        if (n <= 0) continue;
+    std::cout << "[CMD] Listening (TCP) on port " << COMMAND_PORT << std::endl;
 
-        buf[n] = '\0';
-        std::string cmd(buf);
+    static const int  MAX_CLIENTS = 4;      // cap concurrent senders
+    static const size_t MAX_LINE  = 256;    // guard: drop oversized lines
+    struct CmdClient {
+        int fd;
+        std::string buf;                    // partial newline-delimited line
+    };
+    std::vector<CmdClient> clients;
 
-        // Trim whitespace/newline
-        while (!cmd.empty() && (cmd.back() == '\n' || cmd.back() == '\r' || cmd.back() == ' '))
-            cmd.pop_back();
-
-        if (cmd == "CLOSE" && active_mode.load() != MODE_CLOSE) {
+    auto handle_command = [](const std::string& line) {
+        if (line == "CLOSE" && active_mode.load() != MODE_CLOSE) {
             std::cout << "[CMD] Received: CLOSE → switching to 1080p@30" << std::endl;
             requested_mode.store(MODE_CLOSE);
-        } else if (cmd == "FAR" && active_mode.load() != MODE_FAR) {
+        } else if (line == "FAR" && active_mode.load() != MODE_FAR) {
             std::cout << "[CMD] Received: FAR → switching to 4K@25" << std::endl;
             requested_mode.store(MODE_FAR);
         }
+    };
+
+    while (keep_running) {
+        // Rebuild the poll set each pass: listening socket + all clients.
+        std::vector<pollfd> fds;
+        fds.reserve(clients.size() + 1);
+        fds.push_back({cmd_sock, POLLIN, 0});
+        for (const auto& c : clients)
+            fds.push_back({c.fd, POLLIN, 0});
+
+        int nready = poll(fds.data(), (nfds_t)fds.size(), 200); // 200ms timeout
+        if (nready < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (nready == 0) continue;  // timeout — re-check keep_running
+
+        // New connection(s): accept one per poll pass; leftovers stay readable.
+        if (fds[0].revents & POLLIN) {
+            sockaddr_in peer{};
+            socklen_t plen = sizeof(peer);
+            int cfd = accept(cmd_sock, (sockaddr*)&peer, &plen);
+            if (cfd >= 0) {
+                if (clients.size() >= (size_t)MAX_CLIENTS)
+                    close(cfd);                     // at cap — drop the newest
+                else
+                    clients.push_back({cfd, {}});
+            }
+        }
+
+        // Drain each client (iterate backwards so erases are cheap).
+        for (int i = (int)clients.size() - 1; i >= 0; i--) {
+            short revents = fds[i + 1].revents;
+            if (revents & (POLLERR | POLLNVAL)) {
+                close(clients[i].fd);
+                clients.erase(clients.begin() + i);
+                continue;
+            }
+            if (!(revents & (POLLIN | POLLHUP))) continue;
+
+            char buf[256];
+            ssize_t n = recv(clients[i].fd, buf, sizeof(buf), 0);
+            if (n > 0)
+                clients[i].buf.append(buf, (size_t)n);
+
+            // Split buffered bytes into newline-terminated commands.
+            size_t start = 0;
+            size_t end;
+            while ((end = clients[i].buf.find('\n', start)) != std::string::npos) {
+                std::string line = clients[i].buf.substr(start, end - start);
+                start = end + 1;
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+                    line.pop_back();   // trim CR/spaces (newline already consumed)
+                handle_command(line);
+            }
+            if (start > 0)
+                clients[i].buf.erase(0, start);
+
+            // Oversize guard: line without a newline for too long → drop.
+            if (clients[i].buf.size() >= MAX_LINE) {
+                close(clients[i].fd);
+                clients.erase(clients.begin() + i);
+                continue;
+            }
+
+            // Peer closed the connection. With connect-per-command an EOF may
+            // carry a final command without a trailing newline — flush it.
+            if (n == 0 || (revents & POLLHUP)) {
+                if (n == 0 && !clients[i].buf.empty()) {
+                    std::string line = clients[i].buf;
+                    while (!line.empty() && (line.back() == '\r' ||
+                                             line.back() == ' '))
+                        line.pop_back();
+                    handle_command(line);
+                }
+                close(clients[i].fd);
+                clients.erase(clients.begin() + i);
+            }
+        }
     }
+
+    for (auto& c : clients)
+        close(c.fd);
     close(cmd_sock);
 }
 
