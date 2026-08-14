@@ -443,6 +443,9 @@ void camera_thread() {
     std::thread col_net(stream_sender_thread, sockfd, dest, std::ref(color_ring), STREAM_COLOR);
     std::thread dep_net(stream_sender_thread, sockfd, dest, std::ref(depth_ring), STREAM_DEPTH);
 
+    // Context persists for the thread's life; devices are queried per re-acquire.
+    ob::Context context;
+
     // Capture-side benchmark: counts frames handed to the sender threads only.
     // Wire FPS / bandwidth / drain time are reported by the stream senders.
     uint32_t frames_captured = 0;
@@ -463,8 +466,13 @@ void camera_thread() {
         ModeConfig cfg = get_mode_config(current_mode);
 
         try {
-            ob::Pipeline pipe;
-            auto device = pipe.getDevice();
+            auto devList = context.queryDeviceList();
+            if (!devList || devList->deviceCount() == 0) {
+                std::cerr << "[CAM] No devices found, retrying..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                continue;
+            }
+            auto device = devList->getDevice(0);
 
             std::shared_ptr<ob::StreamProfile> colorProfile = nullptr;
             std::shared_ptr<ob::StreamProfile> depthProfile = nullptr;
@@ -504,17 +512,18 @@ void camera_thread() {
                 continue;
             }
 
-            auto config = std::make_shared<ob::Config>();
-            config->enableStream(colorProfile);
-            config->enableStream(depthProfile);
-            // ANY_SITUATION: return a FrameSet as soon as ANY frame is ready,
-            // instead of ALL_TYPE_FRAME_REQUIRE which holds the colour frame
-            // until its paired depth arrives. This decouples the two streams so
-            // colour reaches the wire at its own cadence; depth may trail by up
-            // to a frame (fine — the receiver samples depth natively as a scalar).
-            config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ANY_SITUATION);
+            auto colorConfig = std::make_shared<ob::Config>();
+            colorConfig->enableStream(colorProfile);
+            auto depthConfig = std::make_shared<ob::Config>();
+            depthConfig->enableStream(depthProfile);
 
-            pipe.start(config);
+            // One pipeline per sensor: each FrameSet carries exactly that
+            // sensor's frame, produced on its own cadence. No aggregate mode
+            // needed — a single-stream pipeline cannot hold frames back.
+            ob::Pipeline color_pipe(device);
+            ob::Pipeline depth_pipe(device);
+            color_pipe.start(colorConfig);
+            depth_pipe.start(depthConfig);
             is_switching.store(false);
             std::cout << "[CAM] Streaming: " << cfg.color_w << "x" << cfg.color_h
                       << "@" << cfg.color_fps << " + "
@@ -522,8 +531,9 @@ void camera_thread() {
                       << "@" << cfg.depth_fps
                       << " → " << HOST_IP << ":" << STREAM_PORT << std::endl;
 
-            // Watchdog: track last successful frame time
-            auto last_frame_time = std::chrono::steady_clock::now();
+            // Watchdog: track last successful frame time per pipeline
+            auto last_color_time = std::chrono::steady_clock::now();
+            auto last_depth_time = std::chrono::steady_clock::now();
 
             // Freeze-frame cache lite refresh: while streaming we do NOT copy
             // every frame into the cache (that was a hot-path memcpy). Instead
@@ -537,18 +547,30 @@ void camera_thread() {
                 if (requested_mode.load() != current_mode) break;  // mode switch
 
                 auto frame_t0 = std::chrono::steady_clock::now();
-                auto frameSet = pipe.waitForFrameset(100);
+                auto colorSet = color_pipe.waitForFrameset(100);
+                auto depthSet = depth_pipe.waitForFrameset(100);
 
-                // Watchdog: no frames for 3 seconds -> break to restart pipeline
-                if (!frameSet) {
-                    auto now = std::chrono::steady_clock::now();
-                    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_frame_time).count() > 3) {
-                        std::cerr << "[CAM] Watchdog: no frames for 3s, breaking to restart pipeline" << std::endl;
-                        break;
-                    }
-                    continue;
+                auto colorFrame = colorSet ? colorSet->colorFrame() : nullptr;
+                auto depthFrame = depthSet ? depthSet->depthFrame() : nullptr;
+
+                auto stall_now = std::chrono::steady_clock::now();
+                if (colorFrame) last_color_time = stall_now;
+                if (depthFrame) last_depth_time = stall_now;
+
+                // Watchdog: no frames from a stream for 3 seconds -> break to
+                // restart the pipeline. Each stream is tracked independently so
+                // a stalled sensor triggers recovery even if the other is alive.
+                int color_stall_s = std::chrono::duration_cast<std::chrono::seconds>(stall_now - last_color_time).count();
+                int depth_stall_s = std::chrono::duration_cast<std::chrono::seconds>(stall_now - last_depth_time).count();
+                if (color_stall_s > 3 || depth_stall_s > 3) {
+                    std::cerr << "[CAM] Watchdog: stream silent for " << std::max(color_stall_s, depth_stall_s)
+                              << "s, breaking to restart pipeline" << std::endl;
+                    break;
                 }
-                last_frame_time = frame_t0;
+
+                if (!colorFrame && !depthFrame) {
+                    continue;   // nothing to send this pass
+                }
 
                 // Record the camera frame-cadence delta (only once we have a
                 // previous frame to measure against).
@@ -561,15 +583,9 @@ void camera_thread() {
                 }
                 prev_frame_start = frame_t0;
 
-                // ANY_SITUATION: the FrameSet may carry colour only, depth only,
-                // or both. Each stream is handed off under the same pair frame_id;
-                // the receiver releases on colour and attaches the freshest
-                // complete depth.
-                auto colorFrame = frameSet->colorFrame();
-                auto depthFrame = frameSet->depthFrame();
-                if (!colorFrame && !depthFrame) {
-                    continue;   // nothing to send this frameset
-                }
+                // Each stream is handed off under the same pair frame_id; the
+                // receiver releases on colour and attaches the freshest complete
+                // depth.
                 frame_id++;
                 const uint32_t fid = frame_id;
 
@@ -637,8 +653,9 @@ void camera_thread() {
 
             // switch the mode
             is_switching.store(true);   // start sending cached frames
-            pipe.stop();
-            std::cout << "[CAM] Pipeline stopped (mode switch)" << std::endl;
+            color_pipe.stop();
+            depth_pipe.stop();
+            std::cout << "[CAM] Pipelines stopped (mode switch)" << std::endl;
 
         } catch (const std::exception& e) {
             std::cerr << "[CAM ERROR] " << e.what() << std::endl;
