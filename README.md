@@ -55,16 +55,38 @@ Output binary: `build/udp_streamer`
 
 ## Configuration
 
-Edit `udp_server.cpp` to change the destination IP, ports, chunk size, and batch size:
+### Server (`udp_server.cpp`)
+
+Edit `udp_server.cpp` to change the fallback destination IP, ports, chunk size, and batch size:
 
 ```cpp
-#define HOST_IP             "192.168.0.249"
-#define STREAM_PORT         9999
-#define COMMAND_PORT        9998
+#define HOST_IP             "192.168.0.249"   // Fallback if no receiver registers
+#define STREAM_PORT         9999              // UDP stream port
+#define COMMAND_PORT        9998              // TCP command + registration port
 #define MAX_CHUNK_SIZE      1400
 #define SEND_BATCH          32
 #define RING_SLOTS          2
 ```
+
+- The server must have a **static IP** on the local network (e.g. via DHCP reservation).
+- `HOST_IP` is the **fallback** destination used when no receiver has registered.
+- When a receiver connects to the TCP command port (9998) and sends `REGISTER`, the
+  server captures the receiver's source IP and streams UDP to it instead.
+- No DNS, mDNS, or `CAP_NET_RAW` required.
+
+### Receiver (`udp_receiver.py`)
+
+```bash
+python udp_receiver.py --host <server-static-ip> [--port 9999] [--command-port 9998]
+```
+
+- `--host` (required): the server's static IP address.
+- `--port` (default 9999): UDP stream listening port.
+- `--command-port` (default 9998): TCP command port for registration.
+
+The receiver connects to the server's TCP command port, registers its address,
+and then listens for UDP on `--port`. A background thread maintains the TCP
+connection and auto-reconnects if the link drops (e.g. after a DHCP IP change).
 
 Receiver buffer and queue sizes are constants at the top of each Python file.
 
@@ -91,6 +113,8 @@ Orbbec Camera
     ├─ color_ring (produce/consume)   │
     └─ depth_ring (produce/consume)   └─ frame_queue
   command_thread()  ──TCP──►  CLOSE / FAR mode switch
+    ├─ accept() captures receiver IP  ├─ send REGISTER → server learns our IP
+    └─ send "OK" confirmation          └─ keepalive + auto-reconnect
   freeze_thread()   ──UDP──►  cached-frame bridge during mode switch
 ```
 
@@ -102,7 +126,23 @@ frame_id(4) | chunk_index(2) | total_chunks(2) | data_size(4) | stream_type(1) |
 
 - `stream_type = 0` → MJPEG color (port 9999)
 - `stream_type = 1` → Y16 depth (port 9999)
-- TCP command port: 9998 (`CLOSE` = 1080p@30 + depth@30, `FAR` = 4K@25 + depth@25)
+- TCP command port: 9998
+
+#### Receiver registration protocol (TCP 9998)
+
+Since receivers typically have dynamic DHCP addresses, the server cannot
+hardcode a destination IP. Instead, the receiver registers itself:
+
+1. **Receiver** opens a TCP connection to `server_static_ip:9998`.
+2. **Receiver** sends `REGISTER\n`.
+3. **Server** captures the receiver's source IP from `accept()` (no DNS needed),
+   stores it, and replies `OK\n`.
+4. **Server** streams UDP data to the registered IP on port 9999.
+5. If the TCP connection drops (e.g. DHCP IP renewal), the receiver
+   automatically reconnects and re-registers.
+
+This works with **zero DNS** — the only configuration the receiver needs is
+the server's static IP.
 
 ### Send mode switch commands
 

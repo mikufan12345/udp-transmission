@@ -150,6 +150,36 @@ class _DecoupledUdpReceiver:
         _log.info("UDP receiver stopped")
 
 
+def register_with_server(host: str, command_port: int = 9998, timeout: float = 5.0) -> socket.socket | None:
+    """Connect to the server's TCP command port to register our address.
+
+    The server captures our source IP from the TCP connection and uses it as
+    the UDP destination. This lets the receiver work with a dynamic DHCP IP
+    without any DNS — the server only needs to know its own static IP.
+
+    Returns the TCP socket on success (keep it alive for the connection
+    lifetime so the server can detect disconnection). Returns None on failure.
+    """
+    try:
+        tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp.settimeout(timeout)
+        tcp.connect((host, command_port))
+        tcp.sendall(b"REGISTER\n")
+        resp = tcp.recv(64)
+        if resp and b"OK" in resp:
+            print(f"Registered with server {host}:{command_port}")
+            tcp.settimeout(None)
+            return tcp
+        else:
+            print(f"Server returned unexpected response: {resp!r}")
+            tcp.close()
+            return None
+    except (socket.timeout, ConnectionRefusedError, OSError) as e:
+        print(f"Registration failed: {e}")
+        print(f"Check that the server is running at {host}:{command_port}")
+        return None
+
+
 def main() -> None:
     """Happy-path demo: decode and display paired colour+depth frames."""
     import argparse
@@ -159,11 +189,47 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Production decoupled UDP receiver demo")
     parser.add_argument("--port", type=int, default=9999)
+    parser.add_argument("--host", type=str, default="127.0.0.1",
+                        help="Server (sender) static IP for TCP registration")
+    parser.add_argument("--command-port", type=int, default=9998,
+                        help="Server TCP command port (default: 9998)")
     args = parser.parse_args()
+
+    # Register with the server via TCP so it learns our IP dynamically
+    tcp_conn = register_with_server(args.host, args.command_port)
+    if tcp_conn is None:
+        print("Warning: proceeding without registration — server may use fallback IP")
 
     rx = _DecoupledUdpReceiver(args.port)
     rx.start()
     print(f"Listening on UDP {args.port} (decoupled colour+depth)...")
+
+    # Background reconnection: if the TCP connection drops (e.g. DHCP IP change),
+    # re-register so the server learns our new address.
+    keepalive_stop = threading.Event()
+
+    def _keepalive():
+        nonlocal tcp_conn
+        while not keepalive_stop.is_set():
+            time.sleep(5)
+            if tcp_conn is not None:
+                try:
+                    tcp_conn.sendall(b"")  # zero-length send checks liveness
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    print("TCP connection to server lost, attempting reconnect...")
+                    try:
+                        tcp_conn.close()
+                    except OSError:
+                        pass
+                    tcp_conn = register_with_server(args.host, args.command_port)
+                    if tcp_conn is not None:
+                        print(f"Re-registered with server at {args.host}:{args.command_port}")
+            else:
+                tcp_conn = register_with_server(args.host, args.command_port)
+                if tcp_conn is not None:
+                    print(f"Re-registered with server at {args.host}:{args.command_port}")
+
+    threading.Thread(target=_keepalive, name="tcp-keepalive", daemon=True).start()
 
     frame_count = 0
     start_time = time.perf_counter()
@@ -206,7 +272,10 @@ def main() -> None:
                       f"Depth: {depth_array.shape} | "
                       f"Depth range: {depth_array.min()}-{depth_array.max()}mm")
     finally:
+        keepalive_stop.set()
         rx.stop()
+        if tcp_conn is not None:
+            tcp_conn.close()
         cv2.destroyAllWindows()
 
 

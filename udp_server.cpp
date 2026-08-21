@@ -61,6 +61,25 @@ std::vector<uint8_t> cached_depth;
 uint32_t cached_frame_id = 0;
 int cached_mode = MODE_CLOSE;
 
+// === Dynamic destination state ===
+// Set when a receiver connects to the TCP command port (9998). The camera
+// thread reads this atomic to determine the UDP stream destination.
+// A value of 0 means "not registered" — falls back to HOST_IP.
+std::atomic<in_addr_t> registered_receiver_ip(0);
+std::atomic<bool>      receiver_connected(false);
+
+inline sockaddr_in make_dest(in_addr_t ip) {
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(STREAM_PORT);
+    if (ip != 0) {
+        dest.sin_addr.s_addr = ip;
+    } else {
+        inet_pton(AF_INET, HOST_IP, &dest.sin_addr);
+    }
+    return dest;
+}
+
 // === Per-stream frame handoff ring (camera capture -> stream sender) ===
 // One independent ring per stream (color, depth) so the large depth stream can
 // never queue behind — and delay — the latency-critical color stream. The
@@ -198,7 +217,7 @@ void send_frame_chunks(int sockfd, const sockaddr_in& dest,
 // drop-oldest produce policy means a slow receiver drops stale frames instead
 // of stalling the camera. Color and depth send concurrently on the shared
 // sockfd (POSIX-safe) and are reassembled independently on the receiver.
-void stream_sender_thread(int sockfd, const sockaddr_in& dest,
+void stream_sender_thread(int sockfd, std::atomic<in_addr_t>* dest_ip,
                           FrameRing& ring, uint8_t stream_type) {
     std::vector<uint8_t> outgoing;  // reused drain buffer — swap O(1) from ring
     const char* tag = (stream_type == STREAM_COLOR) ? "[NETC]" : "[NETD]";
@@ -215,6 +234,7 @@ void stream_sender_thread(int sockfd, const sockaddr_in& dest,
         uint8_t m = MODE_CLOSE;
         if (!ring.consume(outgoing, fid, m)) break;   // shutdown, ring drained
 
+        sockaddr_in dest = make_dest(dest_ip->load());
         auto startSend = std::chrono::steady_clock::now();
         send_frame_chunks(sockfd, dest, outgoing.data(), (uint32_t)outgoing.size(),
                           fid, stream_type, m);
@@ -254,9 +274,10 @@ void stream_sender_thread(int sockfd, const sockaddr_in& dest,
 }
 
 // === Freeze frame sender thread ===
-void freeze_thread(int sockfd, const sockaddr_in& dest) {
+void freeze_thread(int sockfd, std::atomic<in_addr_t>* dest_ip) {
     while (keep_running) {
         if (is_switching.load()) {
+            sockaddr_in dest = make_dest(dest_ip->load());
             std::vector<uint8_t> color_copy, depth_copy;
             uint32_t fid;
             int mode;
@@ -363,8 +384,16 @@ void command_thread() {
             if (cfd >= 0) {
                 if (clients.size() >= (size_t)MAX_CLIENTS)
                     close(cfd);                     // at cap — drop the newest
-                else
+                else {
+                    registered_receiver_ip.store(peer.sin_addr.s_addr);
+                    receiver_connected.store(true);
+                    std::cout << "[CMD] Receiver registered from "
+                              << inet_ntoa(peer.sin_addr)
+                              << " (port " << ntohs(peer.sin_port) << ")"
+                              << std::endl;
+                    send(cfd, "OK\n", 3, 0);        // registration confirmation
                     clients.push_back({cfd, {}});
+                }
             }
         }
 
@@ -415,7 +444,10 @@ void command_thread() {
                 }
                 close(clients[i].fd);
                 clients.erase(clients.begin() + i);
-            }
+                if (clients.empty()) {
+                    receiver_connected.store(false);
+                    std::cout << "[CMD] Receiver disconnected" << std::endl;
+                }
         }
     }
 
@@ -433,15 +465,10 @@ void camera_thread() {
     int sndbuf = 4 * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-    sockaddr_in dest{};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(STREAM_PORT);
-    inet_pton(AF_INET, HOST_IP, &dest.sin_addr);
-
     uint32_t frame_id = 0;
-    std::thread frz_thread(freeze_thread, sockfd, dest);
-    std::thread col_net(stream_sender_thread, sockfd, dest, std::ref(color_ring), STREAM_COLOR);
-    std::thread dep_net(stream_sender_thread, sockfd, dest, std::ref(depth_ring), STREAM_DEPTH);
+    std::thread frz_thread(freeze_thread, sockfd, &registered_receiver_ip);
+    std::thread col_net(stream_sender_thread, sockfd, &registered_receiver_ip, std::ref(color_ring), STREAM_COLOR);
+    std::thread dep_net(stream_sender_thread, sockfd, &registered_receiver_ip, std::ref(depth_ring), STREAM_DEPTH);
 
     // Context persists for the thread's life; devices are queried per re-acquire.
     ob::Context context;
@@ -525,11 +552,16 @@ void camera_thread() {
             color_pipe.start(colorConfig);
             depth_pipe.start(depthConfig);
             is_switching.store(false);
+            sockaddr_in dest = make_dest(registered_receiver_ip.load());
             std::cout << "[CAM] Streaming: " << cfg.color_w << "x" << cfg.color_h
                       << "@" << cfg.color_fps << " + "
                       << cfg.depth_w << "x" << cfg.depth_h
                       << "@" << cfg.depth_fps
-                      << " → " << HOST_IP << ":" << STREAM_PORT << std::endl;
+                      << " → " << inet_ntoa(dest.sin_addr) << ":"
+                      << STREAM_PORT
+                      << (receiver_connected.load()
+                              ? "" : " (no receiver registered, using fallback)")
+                      << std::endl;
 
             // Watchdog: track last successful frame time per pipeline
             auto last_color_time = std::chrono::steady_clock::now();
