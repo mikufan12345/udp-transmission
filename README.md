@@ -14,7 +14,7 @@ If you encounter any problems, check in OrbbecViewer.
 
 Set up the repository.
 ```bash
-git pull https://github.com/mikufan12345/udp-transmission.git
+git clone https://github.com/mikufan12345/udp-transmission.git
 cd udp-transmission
 ```
 
