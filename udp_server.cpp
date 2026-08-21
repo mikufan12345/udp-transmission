@@ -448,6 +448,7 @@ void command_thread() {
                     receiver_connected.store(false);
                     std::cout << "[CMD] Receiver disconnected" << std::endl;
                 }
+            }
         }
     }
 
